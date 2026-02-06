@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 # Page config
 st.set_page_config(
-    page_title="CSV Agent - Analyze & Visualize",
+    page_title="Vesco AI - Analyze & Visualize",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -610,7 +610,7 @@ def run_agent(agent_executor: AgentExecutor, user_input: str, chat_history_list:
 # =============================================================================
 
 def main():
-    st.markdown('<h1 class="main-header">📈 CSV Agent</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">📈 Vesco AI </h1>', unsafe_allow_html=True)
 
     # Initialize session state
     if "chat_history_react" not in st.session_state:
