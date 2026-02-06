@@ -720,25 +720,40 @@ def main():
                         "role": "user",
                         "content": user_input
                     })
-                    
-                    with st.spinner("🤔 Analyzing..."):
-                        # Get agent answer
+
+                    # Show user question immediately in chat
+                    with st.chat_message("user"):
+                        st.markdown(user_input)
+
+                    # Show progress during analysis
+                    with st.status("Analyzing...", expanded=True) as status:
+                        progress = st.progress(0, text="Starting analysis...")
+
+                        # Step 1: Run agent (0% -> 50%)
+                        progress.progress(10, text="Querying data and running code...")
                         raw_output = run_agent(
                             executor,
                             user_input,
                             [m for m in st.session_state.chat_history_react[:-1] if m["role"] in ["user", "assistant"]]
                         )
+                        progress.progress(50, text="Data analysis complete. Formatting response...")
+
+                        # Step 2: Format output (50% -> 75%)
                         formatted_output, data_dict = format_agent_output(user_question=user_input, raw_output=raw_output, dfs_dict=dfs_dict, executor=executor)
-                        
-                        # Detect chart opportunity - pass raw_output which has exact numbers
+                        progress.progress(75, text="Checking if a chart would be helpful...")
+
+                        # Step 3: Chart detection & generation (75% -> 100%)
                         chart_intent = detect_chart_opportunity(user_input, raw_output)
-                        
+
                         chart_fig = None
                         if chart_intent:
-                            # Pass raw_output to ensure chart uses same data as answer
+                            progress.progress(85, text="Generating chart...")
                             chart_code = generate_chart_code(user_input, chart_intent, dfs_dict, raw_data=raw_output)
                             if chart_code:
                                 chart_fig = execute_chart_code(chart_code, dfs_dict)
+
+                        progress.progress(100, text="Done!")
+                        status.update(label="Analysis complete", state="complete", expanded=False)
                     
                     # Add assistant message with chart
                     st.session_state.chat_history_react.append({
