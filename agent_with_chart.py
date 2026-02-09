@@ -100,6 +100,24 @@ st.markdown("""
 # Token Management Utilities
 # =============================================================================
 
+def extract_text(content) -> str:
+    """Extract plain text from Claude's content response.
+    Handles both string and list-of-blocks formats."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and "text" in block:
+                parts.append(block["text"])
+            elif hasattr(block, "text"):
+                parts.append(block.text)
+            else:
+                parts.append(str(block))
+        return "\n".join(parts)
+    return str(content)
+
+
 def estimate_tokens(text: str) -> int:
     """Rough estimation: 1 token ≈ 4 characters for English text."""
     return len(text) // 4
@@ -246,7 +264,7 @@ If a chart WOULD help, reply ONLY with valid JSON (no extra text):
 
 If NO chart needed, reply exactly: NO"""
 
-        response = llm.invoke(prompt).content.strip()
+        response = extract_text(llm.invoke(prompt).content).strip()
         logger.info(f"Chart detection response: {response}")
 
         if "NO" in response.upper() and "{" not in response:
@@ -354,7 +372,7 @@ plt.tight_layout()
 
 Generate the complete code now:"""
 
-        response = llm.invoke(prompt).content.strip()
+        response = extract_text(llm.invoke(prompt).content).strip()
         logger.info(f"Generated chart code length: {len(response)}")
 
         # Extract code from markdown if present
@@ -556,7 +574,7 @@ Response:"""
 
         try:
             insights_response = llm.invoke(insight_prompt)
-            insights = insights_response.content.strip()
+            insights = extract_text(insights_response.content).strip()
             return insights, data_dict
         except Exception as e:
             logger.error(f"Failed to generate insights: {str(e)}")
@@ -591,8 +609,8 @@ def run_agent(agent_executor: AgentExecutor, user_input: str, chat_history_list:
             "chat_history": chat_messages,  # Pass as list of message objects
         })
         
-        output = result.get("output", str(result))
-        
+        output = extract_text(result.get("output", str(result)))
+
         if len(output) > 8000:
             output = truncate_text(output, max_tokens=2000)
         
