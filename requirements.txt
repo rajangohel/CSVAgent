@@ -8,12 +8,12 @@ langchain>=0.1.0
 langchain-core>=0.1.0
 langchain-community>=0.0.20
 langchain-experimental>=0.0.50
-langchain-groq>=0.0.1
+langchain-anthropic>=0.1.0
 # langchain_classic is deprecated/renamed, using langchain instead
 # Note: langchain_classic imports should work via langchain package
 
-# Groq API
-groq>=0.4.0
+# Anthropic API
+anthropic>=0.25.0
 
 # Visualization
 matplotlib>=3.7.0

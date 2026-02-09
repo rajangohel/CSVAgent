@@ -30,7 +30,7 @@ from langchain_classic.agents import AgentExecutor
 from langchain_classic.agents.format_scratchpad.tools import format_to_tool_messages
 from langchain_classic.agents.output_parsers.tools import ToolsAgentOutputParser
 from langchain_experimental.utilities import PythonREPL
-from langchain_groq import ChatGroq
+from langchain_anthropic import ChatAnthropic
 
 load_dotenv()
 
@@ -215,13 +215,13 @@ def detect_chart_opportunity(user_question: str, answer_text: str) -> Optional[D
     Decide whether a chart makes sense for this Q&A.
     Returns None or a dict describing the chart idea.
     """
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         return None
 
     try:
-        llm = ChatGroq(
-            model="openai/gpt-oss-120b",
+        llm = ChatAnthropic(
+            model="claude-sonnet-4-5-20250929",
             temperature=0.7,
             api_key=api_key,
         )
@@ -272,13 +272,13 @@ def generate_chart_code(user_question: str, chart_intent: Dict[str, Any], dfs_di
     Generate Python code to create the chart based on the intent.
     Returns Python code as string or None if generation fails.
     """
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         return None
 
     try:
-        llm = ChatGroq(
-            model="openai/gpt-oss-120b",
+        llm = ChatAnthropic(
+            model="claude-sonnet-4-5-20250929",
             temperature=0.1,  # Lower temperature for more deterministic code generation
             api_key=api_key,
         )
@@ -414,7 +414,7 @@ def execute_chart_code(code: str, dfs_dict: Dict[str, pd.DataFrame]) -> Optional
 
 def build_python_repl_tool(dfs_dict: Dict[str, pd.DataFrame]):
     """Create a Python REPL tool with all DataFrames in `dfs` (dict: name -> DataFrame).
-    Tool is named run_dataframe_code to avoid collision with Groq GPT-OSS built-in 'python' tool."""
+    Tool is named run_dataframe_code to avoid collision with built-in 'python' tool names."""
     repl = PythonREPL()
     repl.globals["dfs"] = dfs_dict
     repl.globals["pd"] = pd
@@ -468,7 +468,7 @@ Rule – MUST follow:
 
 
 def get_tool_calling_prompt() -> ChatPromptTemplate:
-    """Prompt for tool-calling agent (native tool use; works with Groq GPT OSS 120B)."""
+    """Prompt for tool-calling agent (native tool use; works with Claude)."""
     return ChatPromptTemplate.from_messages([
         ("system", get_agent_instructions()),
         MessagesPlaceholder("chat_history", optional=True),
@@ -478,21 +478,20 @@ def get_tool_calling_prompt() -> ChatPromptTemplate:
 
 
 def create_agent_executor(dfs_dict: Dict[str, pd.DataFrame]):
-    """Create tool-calling agent with Python REPL and Groq LLM. Binds with tool_choice='auto' so Groq accepts tool calls."""
-    api_key = os.getenv("GROQ_API_KEY")
+    """Create tool-calling agent with Python REPL and Claude LLM."""
+    api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
-        return None, "Set GROQ_API_KEY in .env file to use the agent."
+        return None, "Set ANTHROPIC_API_KEY in .env file to use the agent."
 
-    llm = ChatGroq(
-        model="openai/gpt-oss-120b",
+    llm = ChatAnthropic(
+        model="claude-sonnet-4-5-20250929",
         temperature=0.7,
         api_key=api_key,
     )
-    
+
     tools = [build_python_repl_tool(dfs_dict)]
     prompt = get_tool_calling_prompt()
-    # Groq errors "Tool choice is none, but model called a tool" unless we pass tool_choice="auto"
-    llm_with_tools = llm.bind_tools(tools, tool_choice="auto")
+    llm_with_tools = llm.bind_tools(tools)
     agent = (
         RunnablePassthrough.assign(
             agent_scratchpad=lambda x: format_to_tool_messages(x["intermediate_steps"]),
@@ -517,12 +516,12 @@ def format_agent_output(user_question: str, raw_output: str, dfs_dict: Dict[str,
         # Try to extract numerical data from the raw output for validation
         data_dict = {}
         
-        api_key = os.getenv("GROQ_API_KEY")
+        api_key = os.getenv("ANTHROPIC_API_KEY")
         if not api_key:
             return raw_output, data_dict
-        
-        llm = ChatGroq(
-            model="openai/gpt-oss-120b",
+
+        llm = ChatAnthropic(
+            model="claude-sonnet-4-5-20250929",
             temperature=0.3,
             api_key=api_key,
         )
@@ -531,22 +530,28 @@ def format_agent_output(user_question: str, raw_output: str, dfs_dict: Dict[str,
         for key, df in list(dfs_dict.items())[:3]:
             data_context.append(f"- {key}: {df.shape[0]} rows, columns: {', '.join(df.columns.tolist()[:5])}")
         
-        insight_prompt =f"""You are a sharp business analyst extracting and interpreting exact numbers from analysis results.
-User question: {user_question}
-Raw result (use ONLY these exact values): {final_answer}
-Data context:
-{chr(10).join(data_context)}
-Output a short paragraph (3-5 sentences max) that:
+        insight_prompt = f"""You are a friendly data analyst explaining results to a non-technical user.
 
-Leads with core numerical findings without rounding
-Analyzes implications (trends, comparisons, ratios)
-Adds one concise insight on business meaning
-Stays conversational yet precise
-NO lists, headings, or extras
-MUST include EVERY key number from result
+User asked: {user_question}
+Raw analysis result: {final_answer}
+Datasets used:
+{chr(10).join(data_context)}
+
+Write a 3-5 line human-readable response with this structure:
+Line 1: Directly answer the user's question with the exact numbers found.
+Line 2: Briefly mention what approach was used to get the answer (e.g. "filtered by X, grouped by Y, summed Z") — keep it simple, no code.
+Line 3-5: A short reasoning or insight explaining what the numbers mean or why they matter.
+
+Rules:
+- Write in plain conversational English, like talking to a colleague
+- Use the EXACT numbers from the raw result — never round or guess
+- No bullet points, no headings, no markdown formatting
+- No technical jargon (no "groupby", "aggregation", "dataframe")
+- Keep the total response under 5 sentences
 
 Example:
-"Ajay logged 36 visits last September, with 10 closed deals averaging ₹15,000 each and 20 in-progress ones showing a 15% growth from August. This reflects stronger pipeline building, though open items at 15 indicate room for faster closures. Overall, his consistent 1-2 daily visits point to efficient territory coverage yielding ₹540,000 in potential revenue."
+"The total sales for March came to ₹12,45,000 across 47 orders. This was calculated by looking at all completed orders in March and adding up their values. That's actually a 12% jump compared to February's ₹11,12,000, which suggests the new campaign is driving results. Rajan led with ₹3,20,000 from 15 deals, making him the top performer for the month."
+
 Response:"""
 
         try:
@@ -707,9 +712,9 @@ def main():
         user_input = st.chat_input("Ask me anything about your data...")
         
         if user_input:
-            api_key = os.getenv("GROQ_API_KEY")
+            api_key = os.getenv("ANTHROPIC_API_KEY")
             if not api_key:
-                st.error("⚠️ GROQ_API_KEY not configured.")
+                st.error("⚠️ ANTHROPIC_API_KEY not configured.")
             else:
                 executor, err = create_agent_executor(dfs_dict)
                 if err:
