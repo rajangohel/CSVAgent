@@ -81,7 +81,7 @@ def get_next_llm(temperature: float = 0.7):
         )
     else:  # gemini
         return ChatGoogleGenerativeAI(
-            model="gemini-2.0-flash",
+            model="gemini-3-flash-preview",
             temperature=temperature,
             google_api_key=api_key,
         )
