@@ -78,10 +78,18 @@ st.markdown("""
     .stApp a { color: #4f46e5 !important; }
     .stApp code { color: #1f2937 !important; background: #f3f4f6 !important; }
 
-    /* Sidebar — light background + dark text */
+    /* Sidebar — fixed width, no scrolling, light background */
     section[data-testid="stSidebar"] {
         background-color: white !important;
         color: #111827 !important;
+        width: 260px !important;
+        min-width: 260px !important;
+        max-width: 260px !important;
+    }
+    section[data-testid="stSidebar"] > div {
+        width: 260px !important;
+        min-width: 260px !important;
+        max-width: 260px !important;
     }
     section[data-testid="stSidebar"] p,
     section[data-testid="stSidebar"] span,
@@ -89,11 +97,25 @@ st.markdown("""
         color: #111827 !important;
     }
     section[data-testid="stSidebar"] [data-testid="stSidebarContent"] {
-        padding-top: 0.25rem;
+        padding: 0.25rem 0.6rem 0.5rem 0.6rem !important;
+        overflow-x: hidden !important;
+        overflow-y: auto !important;
+        scrollbar-width: none !important;       /* Firefox */
+        -ms-overflow-style: none !important;    /* IE/Edge */
+    }
+    section[data-testid="stSidebar"] [data-testid="stSidebarContent"]::-webkit-scrollbar {
+        display: none !important;               /* Chrome/Safari */
     }
     section[data-testid="stSidebar"] hr {
-        margin: 0.4rem 0 !important;
+        margin: 0.3rem 0 !important;
         border-color: #e5e7eb !important;
+    }
+    /* Prevent sidebar resize handle */
+    section[data-testid="stSidebar"] [data-testid="stSidebarResizeHandle"],
+    section[data-testid="stSidebar"] .resize-handle,
+    [data-testid="stSidebarResizeHandle"] {
+        display: none !important;
+        pointer-events: none !important;
     }
 
     /* Hide default Streamlit chrome */
@@ -104,12 +126,14 @@ st.markdown("""
     section[data-testid="stSidebar"] .stButton > button {
         text-align: left !important;
         justify-content: flex-start !important;
-        font-size: 0.76rem !important;
+        font-size: 0.7rem !important;
         color: #374151 !important;
         background: transparent !important;
         border: 1px solid transparent !important;
-        border-radius: 6px !important;
-        padding: 0.35rem 0.6rem !important;
+        border-radius: 5px !important;
+        padding: 0.2rem 0.5rem !important;
+        min-height: 0 !important;
+        line-height: 1.3 !important;
     }
     section[data-testid="stSidebar"] .stButton > button p,
     section[data-testid="stSidebar"] .stButton > button span,
@@ -220,24 +244,29 @@ st.markdown("""
         display: flex;
         align-items: center;
         justify-content: space-between;
-        padding: 5px 8px;
+        padding: 3px 6px;
         background: #f9fafb !important;
-        border-radius: 6px;
+        border-radius: 5px;
         border: 1px solid #e5e7eb;
-        margin-bottom: 4px;
-        font-size: 0.75rem;
+        margin-bottom: 3px;
+        font-size: 0.65rem;
     }
     .ds-card .ds-name {
         display: flex;
         align-items: center;
-        gap: 6px;
+        gap: 4px;
         color: #374151 !important;
         font-weight: 500;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        max-width: 160px;
     }
     .ds-card .ds-rows {
         color: #6b7280 !important;
-        font-size: 0.65rem;
+        font-size: 0.58rem;
         font-weight: 500;
+        white-space: nowrap;
     }
 
     /* ===== Reduce spacing in chat area ===== */
@@ -849,9 +878,9 @@ def main():
     # --- Branding (compact) ---
     with st.sidebar:
         st.markdown("""
-        <div style="display:flex; align-items:center; gap:8px; padding:2px 0 6px 0;">
-            <span style="font-size:1.15rem;">📊</span>
-            <span style="font-weight:700; color:#4338ca; font-size:0.95rem;">Vesco Analyst Pro</span>
+        <div style="display:flex; align-items:center; gap:6px; padding:2px 0 4px 0;">
+            <span style="font-size:1rem;">📊</span>
+            <span style="font-weight:700; color:#4338ca; font-size:0.85rem;">Vesco Analyst Pro</span>
         </div>
         """, unsafe_allow_html=True)
 
@@ -906,7 +935,6 @@ def main():
             "How many visits did Ajay do in November?",
             "Top 5 customers by sales",
             "Which salesman has worst collection efficiency?",
-            "Show me the aging summary for Krishna Cycle Stores",
             "What is the visit conversion rate for Nitin?",
         ]
         for i, query in enumerate(suggested_queries):
