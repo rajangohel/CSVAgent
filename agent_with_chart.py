@@ -8,15 +8,12 @@ Uses LangChain ReAct agent with PythonREPL for safe code execution.
 import os
 import logging
 from pathlib import Path
-from typing import Dict, Any, Optional
-import io
-import base64
+from typing import Dict, Optional
 import html as html_lib
 
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
-import json
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
@@ -69,25 +66,10 @@ def _make_llm(provider: str, api_key: str, temperature: float):
         )
     else:
         return ChatGoogleGenerativeAI(
-            model="gemini-2.0-flash",
+            model="gemini-3-flash-preview",
             temperature=temperature,
             google_api_key=api_key,
         )
-
-def get_next_llm(temperature: float = 0.7):
-    """Return the next LLM in round-robin for single-shot calls.
-    If the chosen provider fails (rate limit), automatically tries the next one."""
-    global _single_call_counter
-
-    if not _ALL_ROTATION:
-        _build_rotation()
-    if not _ALL_ROTATION:
-        raise ValueError("No valid API keys found in .env (GROQ_API_KEY_1/2, GOOGLE_API_KEY_1/2)")
-
-    provider, api_key = _ALL_ROTATION[_single_call_counter % len(_ALL_ROTATION)]
-    _single_call_counter += 1
-    logger.info(f"Single-shot LLM: {provider} (key ...{api_key[-6:]})")
-    return _make_llm(provider, api_key, temperature)
 
 def invoke_with_fallback(prompt, temperature: float = 0.7):
     """Invoke a single-shot LLM call with automatic fallback on rate limit."""
@@ -433,23 +415,6 @@ def truncate_text(text: str, max_tokens: int = 2000) -> str:
         text[-keep_chars:]
     )
 
-def truncate_chat_history(chat_history: list, max_messages: int = 6, max_tokens_per_msg: int = 500) -> str:
-    """Truncate chat history to prevent token overflow."""
-    recent_messages = chat_history[-max_messages:]
-    
-    formatted_messages = []
-    for msg in recent_messages:
-        role = msg['role']
-        content = msg.get('content', '')
-        
-        if estimate_tokens(content) > max_tokens_per_msg:
-            content = truncate_text(content, max_tokens_per_msg)
-        
-        formatted_messages.append(f"{role}: {content}")
-    
-    return "\n".join(formatted_messages)
-
-
 # =============================================================================
 # Data loading from data/ folder
 # =============================================================================
@@ -519,153 +484,88 @@ def load_all_data_from_folder(data_folder: str = "data") -> Dict[str, pd.DataFra
     return combined
 
 
+def build_data_schema(dfs_dict: Dict[str, pd.DataFrame]) -> str:
+    """Build a compact schema string for all datasets.
+    Gives the LLM column names, types, and sample values so it can skip exploration."""
+    parts = []
+    for key, df in dfs_dict.items():
+        cols = []
+        for col in df.columns[:25]:  # cap at 25 columns
+            dtype = str(df[col].dtype)
+            if df[col].dtype in ["float64", "int64", "float32", "int32"]:
+                non_null = df[col].dropna()
+                if len(non_null) > 0:
+                    cols.append(f"  {col} ({dtype}): min={non_null.min()}, max={non_null.max()}")
+                else:
+                    cols.append(f"  {col} ({dtype}): all null")
+            elif df[col].dtype == "object":
+                samples = df[col].dropna().unique()[:4]
+                samples = [str(s)[:30] for s in samples]
+                cols.append(f"  {col} (str): {samples}")
+            else:
+                cols.append(f"  {col} ({dtype})")
+        parts.append(f"Dataset '{key}' ({len(df)} rows, {len(df.columns)} cols):\n" + "\n".join(cols))
+    return "\n\n".join(parts)
+
+
 # =============================================================================
-# Chart Detection and Generation
+# Chart Detection and Generation (combined — single LLM call)
 # =============================================================================
 
-def detect_chart_opportunity(user_question: str, answer_text: str) -> Optional[Dict[str, Any]]:
-    """
-    Decide whether a chart makes sense for this Q&A.
-    Returns None or a dict describing the chart idea.
-    """
+def detect_and_generate_chart(user_question: str, answer_text: str, dfs_dict: Dict[str, pd.DataFrame]) -> Optional[str]:
+    """Single LLM call: decide if chart is needed AND generate code if yes.
+    Returns chart Python code string or None."""
     try:
-        prompt = f"""You are deciding whether a chart would meaningfully support the answer.
-
-Question: {user_question}
-
-Answer: {answer_text}
-
-Rules:
-- If the answer contains NUMERICAL data that would benefit from visualization (comparisons, trends, distributions, rankings), suggest a chart
-- If the answer is purely textual, descriptive, or a simple yes/no, reply exactly: NO
-- Chart types: bar_chart, line_chart, pie_chart, scatter_plot, histogram
-
-If a chart WOULD help, reply ONLY with valid JSON (no extra text):
-{{
-  "chart_type": "bar_chart or line_chart or pie_chart or scatter_plot or histogram",
-  "data_description": "what data to visualize",
-  "reason": "brief reason (max 15 words)"
-}}
-
-If NO chart needed, reply exactly: NO"""
-
-        response = extract_text(invoke_with_fallback(prompt, temperature=0.7).content).strip()
-        logger.info(f"Chart detection response: {response}")
-
-        if "NO" in response.upper() and "{" not in response:
-            return None
-
-        # Try to extract JSON from response
-        if "{" in response:
-            json_start = response.index("{")
-            json_end = response.rindex("}") + 1
-            json_str = response[json_start:json_end]
-            chart_data = json.loads(json_str)
-            return chart_data
-        
-        return None
-        
-    except Exception as e:
-        logger.error(f"Chart detection error: {str(e)}", exc_info=True)
-        return None
-
-
-def generate_chart_code(user_question: str, chart_intent: Dict[str, Any], dfs_dict: Dict[str, pd.DataFrame], raw_data: str = None) -> Optional[str]:
-    """
-    Generate Python code to create the chart based on the intent.
-    Returns Python code as string or None if generation fails.
-    """
-    try:
-        # Get COMPLETE dataset info - all datasets with ALL columns
+        dataset_keys = list(dfs_dict.keys())
         dataset_info = []
         for key, df in dfs_dict.items():
-            # Show ALL columns, not just first few
-            all_columns = df.columns.tolist()
-            dataset_info.append(f"  - '{key}': {len(df)} rows, columns = {all_columns}")
+            dataset_info.append(f"  - '{key}': {len(df)} rows, columns = {df.columns.tolist()}")
 
-        # Get more context from raw_data
-        raw_data_context = ""
-        if raw_data:
-            # Include more of the analysis result (up to 1500 chars instead of 500)
-            raw_data_context = f"\nAgent's exact analysis result:\n{raw_data[:1500]}"
-
-        # List all dataset keys explicitly
-        dataset_keys = list(dfs_dict.keys())
-        
-        prompt = f"""Generate Python code to create a {chart_intent['chart_type']} for this question.
+        prompt = f"""You are a data visualization assistant. Given a question and its answer, decide if a chart helps AND generate the code in ONE response.
 
 Question: {user_question}
-Data to visualize: {chart_intent.get('data_description', '')}
-{raw_data_context}
+Answer: {answer_text[:1500]}
 
-AVAILABLE DATASETS in `dfs` dictionary - USE THESE EXACT KEYS:
+DATASETS in `dfs` dict:
 {chr(10).join(dataset_info)}
 
-CRITICAL RULES:
-1. You MUST use dfs['EXACT_KEY_FROM_ABOVE'] - do NOT make up dataset names
-2. First dataset key to use: '{dataset_keys[0] if dataset_keys else 'unknown'}'
-3. Use ONLY the column names listed above - do NOT invent column names
-4. Copy the EXACT data processing logic from the analysis result above
-5. If analysis used filtering/groupby/aggregation, use THE EXACT SAME code
+RULES:
+- If the answer is purely textual, yes/no, or a single number → reply exactly: NO
+- If the answer has numerical comparisons, rankings, trends, or distributions → generate chart code
 
-Code Requirements:
-- Use matplotlib for visualization
-- Create figure with figsize=(8, 4.5)
-- Add value labels on bars/points showing exact numbers
-- Use plt.tight_layout()
-- Store figure in variable named 'fig'
-- Use seaborn style: sns.set_style("whitegrid")
-
-Generate ONLY the Python code, no explanations:
-
+If chart IS needed, reply with ONLY a Python code block (no other text):
 ```python
 import matplotlib.pyplot as plt
 import seaborn as sns
 sns.set_style("whitegrid")
-
-# Get data using EXACT key from dfs dict
-df = dfs['{dataset_keys[0] if dataset_keys else 'key'}']  # MUST use exact key
-
-# Data processing - copy from analysis above
-# ...
-
-# Create plot
+df = dfs['{dataset_keys[0] if dataset_keys else "key"}']
+# ... data processing matching the answer above ...
 fig, ax = plt.subplots(figsize=(8, 4.5))
-
-# Plot data and add value labels
-# bars = ax.bar(x, y)
-# for bar in bars:
-#     height = bar.get_height()
-#     ax.text(bar.get_x() + bar.get_width()/2., height,
-#             f'{{int(height)}}', ha='center', va='bottom', fontsize=9)
-
-ax.set_title('Title', fontsize=12, fontweight='bold')
-ax.set_xlabel('X', fontsize=10)
-ax.set_ylabel('Y', fontsize=10)
+# ... plot with value labels ...
+ax.set_title('...', fontsize=12, fontweight='bold')
 plt.tight_layout()
 ```
 
-Generate the complete code now:"""
+If NO chart needed, reply exactly: NO"""
 
-        response = extract_text(invoke_with_fallback(prompt, temperature=0.1).content).strip()
-        logger.info(f"Generated chart code length: {len(response)}")
+        response = extract_text(invoke_with_fallback(prompt, temperature=0.2).content).strip()
+        logger.info(f"Chart detect+gen response length: {len(response)}")
 
-        # Extract code from markdown if present
+        if "NO" in response.upper() and "```" not in response:
+            return None
+
+        # Extract code
         if "```python" in response:
-            code_start = response.index("```python") + 9
-            code_end = response.rindex("```")
-            code = response[code_start:code_end].strip()
+            code = response[response.index("```python") + 9:response.rindex("```")].strip()
+            return code
         elif "```" in response:
-            code_start = response.index("```") + 3
-            code_end = response.rindex("```")
-            code = response[code_start:code_end].strip()
-        else:
-            code = response
+            code = response[response.index("```") + 3:response.rindex("```")].strip()
+            return code
 
-        return code
+        return None
 
     except Exception as e:
-        logger.error(f"Chart code generation error: {str(e)}", exc_info=True)
+        logger.error(f"Chart detect+gen error: {str(e)}", exc_info=True)
         return None
 
 
@@ -735,44 +635,45 @@ def build_python_repl_tool(dfs_dict: Dict[str, pd.DataFrame]):
     return run_dataframe_code
 
 
-def get_agent_instructions() -> str:
-    """Agent instructions for tool-calling agent."""
-    return """You are a precise business metrics analyst. Your only job is to extract EXACT numbers and calculate meaningful ratios/trends from the data.
+def get_agent_instructions(schema: str) -> str:
+    """Agent instructions with embedded data schema + formatting rules."""
+    return f"""You are a business metrics analyst for an Indian distribution company. Extract EXACT numbers from the data.
 
-You have exactly one tool: run_dataframe_code. Use only this tool to run Python code. Do not request any other code execution or python tool.
+TOOL: run_dataframe_code — execute Python code. Use print() to show output.
 
-All loaded datasets are in the dict `dfs` — do not read files again.
-- Keys are file names (e.g. 'sales.csv') or 'filename::SheetName' for Excel sheets (e.g. 'report.xlsx::Q1').
-- Use dfs['key'] to get a DataFrame. Example: df1 = dfs['data.csv']; df2 = dfs['report.xlsx::Sheet1'].
-- If only one dataset exists, it is also in variable `df` for convenience.
+DATA SCHEMA (use these exact column names — do NOT run df.columns or df.head to explore):
+{schema}
 
-Rule – MUST follow:
-1. ALWAYS write & execute code to get numbers — never guess/estimate
-2. Use groupby/agg/value_counts/sort_values to get accurate counts, sums, averages
-3. Calculate percentages, growth rates, top-N when relevant
-4. For dates: convert Excel serial dates (e.g. 45903) → pd.to_datetime(..., unit='D', origin='1899-12-30')
-5. Show concise output: .head(6), .tail(3), value_counts(), describe(), or aggregated tables
-6. If you get an error, fix the code and try again.
-7. Prefer running code to get the answer rather than guessing.
-8. If you cannot answer with code, reply "I don't know".
-9. Do not create example or fake dataframes.
-10. When asked for chart data, produce the aggregated/transformed data (e.g. as dict or list) suitable for plotting; use print() so the result is visible.
-11. Final Answer must be short, number-heavy, analytical (1–2 insights max)"""
+Access: dfs['key'] for each dataset. If only one dataset, `df` is also available.
+
+RULES:
+1. Write & execute code to get numbers — never guess
+2. Use groupby/agg/value_counts/sort_values for accurate results
+3. For dates: convert Excel serial dates → pd.to_datetime(..., unit='D', origin='1899-12-30')
+4. If error, fix and retry
+5. Do not create fake data
+
+RESPONSE FORMAT (your final answer must follow this exactly):
+- Start with 2-3 sentence insight answering the question with EXACT numbers
+- If multiple items (rankings, comparisons, breakdowns), add a markdown table
+- Use ₹ for currency values
+- No technical jargon (no "groupby", "dataframe", "aggregation")
+- Keep it concise — max 1-2 insights"""
 
 
-def get_tool_calling_prompt() -> ChatPromptTemplate:
-    """Prompt for tool-calling agent (native tool use; works with Claude)."""
+def get_tool_calling_prompt(schema: str) -> ChatPromptTemplate:
+    """Prompt for tool-calling agent with data schema baked in."""
     return ChatPromptTemplate.from_messages([
-        ("system", get_agent_instructions()),
+        ("system", get_agent_instructions(schema)),
         ("human", "{input}"),
         MessagesPlaceholder("agent_scratchpad"),
     ])
 
 
-def _build_executor_for_llm(llm, dfs_dict: Dict[str, pd.DataFrame]) -> AgentExecutor:
-    """Build an AgentExecutor with the given LLM."""
+def _build_executor_for_llm(llm, dfs_dict: Dict[str, pd.DataFrame], schema: str) -> AgentExecutor:
+    """Build an AgentExecutor with data schema baked into the prompt."""
     tools = [build_python_repl_tool(dfs_dict)]
-    prompt = get_tool_calling_prompt()
+    prompt = get_tool_calling_prompt(schema)
     llm_with_tools = llm.bind_tools(tools)
     agent = (
         RunnablePassthrough.assign(
@@ -792,79 +693,17 @@ def create_agent_executor():
     return _ALL_ROTATION, None
 
 
-def format_agent_output(user_question: str, raw_output: str, dfs_dict: Dict[str, pd.DataFrame]) -> tuple:
-    """
-    Format the agent output to be more user-friendly.
-    Returns: (formatted_text, data_dict) where data_dict contains the actual values for chart validation
-    """
-    try:
-        final_answer = raw_output.strip()
-        
-        # Try to extract numerical data from the raw output for validation
-        data_dict = {}
-        
-        data_context = []
-        for key, df in list(dfs_dict.items())[:3]:
-            data_context.append(f"- {key}: {df.shape[0]} rows, columns: {', '.join(df.columns.tolist()[:5])}")
-        
-        insight_prompt = f"""You are a friendly data analyst explaining results to a non-technical user.
-
-User asked: {user_question}
-Raw analysis result: {final_answer}
-Datasets used:
-{chr(10).join(data_context)}
-
-FORMAT — insight FIRST, then table if needed:
-
-**PART 1 — Insight (3-5 sentences, ALWAYS comes first):**
-- Directly answer the question with exact numbers
-- Add one brief insight about what the numbers mean or why they matter
-- Write in plain conversational English, no technical jargon
-
-**PART 2 — Table (AFTER the insight, only if applicable):**
-- If the raw result has multiple items/rows (rankings, comparisons, breakdowns), add a markdown table BELOW the insight
-- Include ALL items from the raw result
-- If the answer is a single number or simple yes/no, skip the table
-
-RULES:
-- Use EXACT numbers from the raw result — never round or guess
-- No technical jargon (no "groupby", "aggregation", "dataframe")
-- Use ₹ for currency if values look like Indian Rupees
-
-EXAMPLE:
-The top 5 customers by total sales are led by Krishna Cycle Stores at ₹8,45,000. Together these five account for roughly 38% of total revenue.
-
-| Rank | Customer | Total Sales | Orders |
-|------|----------|-------------|--------|
-| 1 | Krishna Cycle Stores | ₹8,45,000 | 23 |
-| 2 | Sharma Enterprises | ₹6,12,000 | 18 |
-| 3 | Patel Trading Co | ₹5,78,000 | 15 |
-
-Response:"""
-
-        try:
-            insights_response = invoke_with_fallback(insight_prompt, temperature=0.3)
-            insights = extract_text(insights_response.content).strip()
-            return insights, data_dict
-        except Exception as e:
-            logger.error(f"Failed to generate insights: {str(e)}")
-            return final_answer, data_dict
-        
-    except Exception as e:
-        logger.error(f"Error formatting output: {str(e)}")
-        return raw_output, {}
-
-
 def run_agent(rotation_list: list, dfs_dict: Dict[str, pd.DataFrame], user_input: str) -> str:
     """Try each provider in rotation until one succeeds.
     Builds a fresh executor per attempt so a bad key doesn't block everything."""
     last_error = None
+    schema = build_data_schema(dfs_dict)
 
     for provider, api_key in rotation_list:
         try:
             logger.info(f"Agent attempt: {provider} (key ...{api_key[-6:]})")
             llm = _make_llm(provider, api_key, temperature=0.7)
-            executor = _build_executor_for_llm(llm, dfs_dict)
+            executor = _build_executor_for_llm(llm, dfs_dict, schema)
 
             result = executor.invoke({
                 "input": user_input,
@@ -1144,25 +983,15 @@ def main():
         with st.status("Analyzing your data…", expanded=True) as status:
             progress = st.progress(0, text="Starting analysis…")
 
-            progress.progress(10, text="Querying data and running code…")
-            raw_output = run_agent(rotation_list, dfs_dict, user_input)
-            progress.progress(50, text="Data analysis complete. Formatting response…")
+            progress.progress(15, text="Querying data and running code…")
+            formatted_output = run_agent(rotation_list, dfs_dict, user_input)
+            progress.progress(70, text="Checking if a chart would be helpful…")
 
-            formatted_output, data_dict = format_agent_output(
-                user_question=user_input,
-                raw_output=raw_output,
-                dfs_dict=dfs_dict,
-            )
-            progress.progress(75, text="Checking if a chart would be helpful…")
-
-            chart_intent = detect_chart_opportunity(user_input, raw_output)
             chart_fig = None
-            if chart_intent:
-                progress.progress(85, text="Generating chart…")
-                chart_code = generate_chart_code(
-                    user_input, chart_intent, dfs_dict, raw_data=raw_output)
-                if chart_code:
-                    chart_fig = execute_chart_code(chart_code, dfs_dict)
+            chart_code = detect_and_generate_chart(user_input, formatted_output, dfs_dict)
+            if chart_code:
+                progress.progress(90, text="Generating chart…")
+                chart_fig = execute_chart_code(chart_code, dfs_dict)
 
             progress.progress(100, text="Done!")
             status.update(label="Analysis complete", state="complete", expanded=False)
