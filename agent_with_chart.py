@@ -40,21 +40,13 @@ load_dotenv()
 # Round-Robin LLM Provider (Groq ↔ Gemini rotation)
 # =============================================================================
 
-# Separate lists: Gemini keys (high RPM, used for multi-step agent)
-#                 All keys rotated for single-shot calls
-_GEMINI_KEYS = []
-_ALL_ROTATION = []  # groq1 → gemini1 → groq2 → gemini2
+# All keys rotated: groq1 → gemini1 → groq2 → gemini2
+_ALL_ROTATION = []
 
 def _build_rotation():
-    """Build the rotation lists from env keys."""
-    global _GEMINI_KEYS, _ALL_ROTATION
-    _GEMINI_KEYS = []
+    """Build the rotation list from env keys."""
+    global _ALL_ROTATION
     _ALL_ROTATION = []
-
-    for key in [os.getenv("GOOGLE_API_KEY_1"), os.getenv("GOOGLE_API_KEY_2")]:
-        if key and not key.startswith("your_"):
-            _GEMINI_KEYS.append(key)
-
     pairs = [
         ("groq",   os.getenv("GROQ_API_KEY_1")),
         ("gemini", os.getenv("GOOGLE_API_KEY_1")),
@@ -66,7 +58,6 @@ def _build_rotation():
             _ALL_ROTATION.append((provider, key))
 
 _single_call_counter = 0
-_gemini_call_counter = 0
 
 def _make_llm(provider: str, api_key: str, temperature: float):
     """Create an LLM instance for the given provider."""
@@ -82,25 +73,6 @@ def _make_llm(provider: str, api_key: str, temperature: float):
             temperature=temperature,
             google_api_key=api_key,
         )
-
-def get_agent_llm(temperature: float = 0.7):
-    """Return a Gemini LLM for the ReAct agent (multi-step, needs high RPM).
-    Alternates between the two Gemini keys."""
-    global _gemini_call_counter
-
-    if not _GEMINI_KEYS:
-        _build_rotation()
-    if not _GEMINI_KEYS:
-        raise ValueError("No Gemini API keys found (GOOGLE_API_KEY_1/2)")
-
-    key = _GEMINI_KEYS[_gemini_call_counter % len(_GEMINI_KEYS)]
-    _gemini_call_counter += 1
-    logger.info(f"Agent LLM: gemini (key ...{key[-6:]})")
-    return ChatGoogleGenerativeAI(
-        model="gemini-2.0-flash",
-        temperature=temperature,
-        google_api_key=key,
-    )
 
 def get_next_llm(temperature: float = 0.7):
     """Return the next LLM in round-robin for single-shot calls.
@@ -797,13 +769,8 @@ def get_tool_calling_prompt() -> ChatPromptTemplate:
     ])
 
 
-def create_agent_executor(dfs_dict: Dict[str, pd.DataFrame]):
-    """Create tool-calling agent with Gemini LLM (high RPM for multi-step agent)."""
-    if not _GEMINI_KEYS and not _ALL_ROTATION:
-        return None, "No API keys found. Set GROQ_API_KEY_1/2 and GOOGLE_API_KEY_1/2 in .env file."
-
-    llm = get_agent_llm(temperature=0.7)
-
+def _build_executor_for_llm(llm, dfs_dict: Dict[str, pd.DataFrame]) -> AgentExecutor:
+    """Build an AgentExecutor with the given LLM."""
     tools = [build_python_repl_tool(dfs_dict)]
     prompt = get_tool_calling_prompt()
     llm_with_tools = llm.bind_tools(tools)
@@ -815,12 +782,17 @@ def create_agent_executor(dfs_dict: Dict[str, pd.DataFrame]):
         | llm_with_tools
         | ToolsAgentOutputParser()
     )
-    executor = AgentExecutor(agent=agent, tools=tools, verbose=True, handle_parsing_errors=True)
-    
-    return executor, None
+    return AgentExecutor(agent=agent, tools=tools, verbose=True, handle_parsing_errors=True)
 
 
-def format_agent_output(user_question: str, raw_output: str, dfs_dict: Dict[str, pd.DataFrame], executor: AgentExecutor = None) -> tuple:
+def create_agent_executor():
+    """Return the rotation list for run_agent to try each provider."""
+    if not _ALL_ROTATION:
+        return None, "No API keys found. Set GROQ_API_KEY_1/2 and GOOGLE_API_KEY_1/2 in .env file."
+    return _ALL_ROTATION, None
+
+
+def format_agent_output(user_question: str, raw_output: str, dfs_dict: Dict[str, pd.DataFrame]) -> tuple:
     """
     Format the agent output to be more user-friendly.
     Returns: (formatted_text, data_dict) where data_dict contains the actual values for chart validation
@@ -883,30 +855,42 @@ Response:"""
         return raw_output, {}
 
 
-def run_agent(agent_executor: AgentExecutor, user_input: str) -> str:
-    """Invoke agent and return final output."""
-    try:
-        result = agent_executor.invoke({
-            "input": user_input,
-        })
-        
-        output = extract_text(result.get("output", str(result)))
+def run_agent(rotation_list: list, dfs_dict: Dict[str, pd.DataFrame], user_input: str) -> str:
+    """Try each provider in rotation until one succeeds.
+    Builds a fresh executor per attempt so a bad key doesn't block everything."""
+    last_error = None
 
-        if len(output) > 8000:
-            output = truncate_text(output, max_tokens=2000)
-        
-        return output
-        
-    except Exception as e:
-        error_msg = str(e)
-        logger.error(f"Agent execution failed: {error_msg}", exc_info=True)
-        
-        if "413" in error_msg or "Request too large" in error_msg:
-            return "⚠️ Request too large. Try a simpler question or clear chat history."
-        elif "rate_limit" in error_msg.lower():
-            return "⚠️ Rate limit exceeded. Please wait and try again."
-        else:
-            return "⚠️ Something went wrong. Please try again or rephrase your question."
+    for provider, api_key in rotation_list:
+        try:
+            logger.info(f"Agent attempt: {provider} (key ...{api_key[-6:]})")
+            llm = _make_llm(provider, api_key, temperature=0.7)
+            executor = _build_executor_for_llm(llm, dfs_dict)
+
+            result = executor.invoke({
+                "input": user_input,
+            })
+
+            output = extract_text(result.get("output", str(result)))
+            if len(output) > 8000:
+                output = truncate_text(output, max_tokens=2000)
+            return output
+
+        except Exception as e:
+            last_error = e
+            err_str = str(e).lower()
+            logger.warning(f"Agent failed with {provider}: {e}")
+            # If rate-limit / quota / connectivity → try next provider
+            if any(kw in err_str for kw in ["429", "rate", "quota", "resource_exhausted", "retrying", "503"]):
+                continue
+            # For other errors, also try next provider instead of crashing
+            continue
+
+    # All providers failed
+    error_msg = str(last_error) if last_error else "Unknown error"
+    logger.error(f"All agent providers failed. Last error: {error_msg}")
+    if "413" in error_msg or "Request too large" in error_msg:
+        return "⚠️ Request too large. Try a simpler question or clear chat history."
+    return "⚠️ All API providers failed. Check your API keys in .env file or try again later."
 
 
 # =============================================================================
@@ -1142,7 +1126,7 @@ def main():
             st.error("⚠️ No API keys configured. Set GROQ_API_KEY_1/2 and GOOGLE_API_KEY_1/2 in .env file.")
             return
 
-        executor, err = create_agent_executor(dfs_dict)
+        rotation_list, err = create_agent_executor()
         if err:
             st.error(f"⚠️ {err}")
             return
@@ -1161,14 +1145,13 @@ def main():
             progress = st.progress(0, text="Starting analysis…")
 
             progress.progress(10, text="Querying data and running code…")
-            raw_output = run_agent(executor, user_input)
+            raw_output = run_agent(rotation_list, dfs_dict, user_input)
             progress.progress(50, text="Data analysis complete. Formatting response…")
 
             formatted_output, data_dict = format_agent_output(
                 user_question=user_input,
                 raw_output=raw_output,
                 dfs_dict=dfs_dict,
-                executor=executor,
             )
             progress.progress(75, text="Checking if a chart would be helpful…")
 
