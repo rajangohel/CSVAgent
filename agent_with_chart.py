@@ -767,20 +767,31 @@ Raw analysis result: {final_answer}
 Datasets used:
 {chr(10).join(data_context)}
 
-Write a 3-5 line human-readable response with this structure:
-Line 1: Directly answer the user's question with the exact numbers found.
-Line 2: Briefly mention what approach was used to get the answer (e.g. "filtered by X, grouped by Y, summed Z") — keep it simple, no code.
-Line 3-5: A short reasoning or insight explaining what the numbers mean or why they matter.
+FORMAT — insight FIRST, then table if needed:
 
-Rules:
-- Write in plain conversational English, like talking to a colleague
-- Use the EXACT numbers from the raw result — never round or guess
-- No bullet points, no headings, no markdown formatting
+**PART 1 — Insight (3-5 sentences, ALWAYS comes first):**
+- Directly answer the question with exact numbers
+- Add one brief insight about what the numbers mean or why they matter
+- Write in plain conversational English, no technical jargon
+
+**PART 2 — Table (AFTER the insight, only if applicable):**
+- If the raw result has multiple items/rows (rankings, comparisons, breakdowns), add a markdown table BELOW the insight
+- Include ALL items from the raw result
+- If the answer is a single number or simple yes/no, skip the table
+
+RULES:
+- Use EXACT numbers from the raw result — never round or guess
 - No technical jargon (no "groupby", "aggregation", "dataframe")
-- Keep the total response under 5 sentences
+- Use ₹ for currency if values look like Indian Rupees
 
-Example:
-"The total sales for March came to ₹12,45,000 across 47 orders. This was calculated by looking at all completed orders in March and adding up their values. That's actually a 12% jump compared to February's ₹11,12,000, which suggests the new campaign is driving results. Rajan led with ₹3,20,000 from 15 deals, making him the top performer for the month."
+EXAMPLE:
+The top 5 customers by total sales are led by Krishna Cycle Stores at ₹8,45,000. Together these five account for roughly 38% of total revenue.
+
+| Rank | Customer | Total Sales | Orders |
+|------|----------|-------------|--------|
+| 1 | Krishna Cycle Stores | ₹8,45,000 | 23 |
+| 2 | Sharma Enterprises | ₹6,12,000 | 18 |
+| 3 | Patel Trading Co | ₹5,78,000 | 15 |
 
 Response:"""
 
