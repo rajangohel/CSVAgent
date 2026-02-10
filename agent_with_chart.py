@@ -827,7 +827,7 @@ def main():
             "How many visits did Ajay do in November?",
             "Top 5 customers by sales",
             "Which salesman has worst collection efficiency?",
-            "Show me the aging summary for Krishna Cycle Stores"
+            "Show me the aging summary for Krishna Cycle Stores",
             "What is the visit conversion rate for Nitin?",
         ]
         for i, query in enumerate(suggested_queries):
