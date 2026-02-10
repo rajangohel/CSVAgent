@@ -9,6 +9,8 @@ langchain-core>=0.1.0
 langchain-community>=0.0.20
 langchain-experimental>=0.0.50
 langchain-anthropic>=0.1.0
+langchain-google-genai
+langchain-groq
 # langchain_classic is deprecated/renamed, using langchain instead
 # Note: langchain_classic imports should work via langchain package
 
