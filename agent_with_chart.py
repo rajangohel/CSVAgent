@@ -30,9 +30,63 @@ from langchain_classic.agents import AgentExecutor
 from langchain_classic.agents.format_scratchpad.tools import format_to_tool_messages
 from langchain_classic.agents.output_parsers.tools import ToolsAgentOutputParser
 from langchain_experimental.utilities import PythonREPL
-from langchain_anthropic import ChatAnthropic
+from langchain_groq import ChatGroq
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 load_dotenv()
+
+
+# =============================================================================
+# Round-Robin LLM Provider (Groq ↔ Gemini rotation)
+# =============================================================================
+
+# Order: groq1 → gemini1 → groq2 → gemini2 → repeat
+_LLM_ROTATION = []
+
+def _build_rotation():
+    """Build the rotation list from env keys."""
+    global _LLM_ROTATION
+    _LLM_ROTATION = []
+    pairs = [
+        ("groq",   os.getenv("GROQ_API_KEY_1")),
+        ("gemini", os.getenv("GOOGLE_API_KEY_1")),
+        ("groq",   os.getenv("GROQ_API_KEY_2")),
+        ("gemini", os.getenv("GOOGLE_API_KEY_2")),
+    ]
+    for provider, key in pairs:
+        if key and not key.startswith("your_"):
+            _LLM_ROTATION.append((provider, key))
+
+_llm_call_counter = 0
+
+def get_next_llm(temperature: float = 0.7):
+    """Return the next LLM in the round-robin rotation."""
+    global _llm_call_counter
+
+    if not _LLM_ROTATION:
+        _build_rotation()
+    if not _LLM_ROTATION:
+        raise ValueError("No valid API keys found in .env (GROQ_API_KEY_1/2, GOOGLE_API_KEY_1/2)")
+
+    provider, api_key = _LLM_ROTATION[_llm_call_counter % len(_LLM_ROTATION)]
+    _llm_call_counter += 1
+
+    logger.info(f"LLM rotation #{_llm_call_counter}: using {provider} (key ...{api_key[-6:]})")
+
+    if provider == "groq":
+        return ChatGroq(
+            model="llama-3.3-70b-versatile",
+            temperature=temperature,
+            api_key=api_key,
+        )
+    else:  # gemini
+        return ChatGoogleGenerativeAI(
+            model="gemini-2.0-flash",
+            temperature=temperature,
+            google_api_key=api_key,
+        )
+
+_build_rotation()
 
 # Logging
 logging.basicConfig(
@@ -444,16 +498,8 @@ def detect_chart_opportunity(user_question: str, answer_text: str) -> Optional[D
     Decide whether a chart makes sense for this Q&A.
     Returns None or a dict describing the chart idea.
     """
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        return None
-
     try:
-        llm = ChatAnthropic(
-            model="claude-sonnet-4-5-20250929",
-            temperature=0.7,
-            api_key=api_key,
-        )
+        llm = get_next_llm(temperature=0.7)
 
         prompt = f"""You are deciding whether a chart would meaningfully support the answer.
 
@@ -501,16 +547,8 @@ def generate_chart_code(user_question: str, chart_intent: Dict[str, Any], dfs_di
     Generate Python code to create the chart based on the intent.
     Returns Python code as string or None if generation fails.
     """
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        return None
-
     try:
-        llm = ChatAnthropic(
-            model="claude-sonnet-4-5-20250929",
-            temperature=0.1,  # Lower temperature for more deterministic code generation
-            api_key=api_key,
-        )
+        llm = get_next_llm(temperature=0.1)
 
         # Get COMPLETE dataset info - all datasets with ALL columns
         dataset_info = []
@@ -706,16 +744,11 @@ def get_tool_calling_prompt() -> ChatPromptTemplate:
 
 
 def create_agent_executor(dfs_dict: Dict[str, pd.DataFrame]):
-    """Create tool-calling agent with Python REPL and Claude LLM."""
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        return None, "Set ANTHROPIC_API_KEY in .env file to use the agent."
+    """Create tool-calling agent with Groq/Gemini LLM (round-robin)."""
+    if not _LLM_ROTATION:
+        return None, "No API keys found. Set GROQ_API_KEY_1/2 and GOOGLE_API_KEY_1/2 in .env file."
 
-    llm = ChatAnthropic(
-        model="claude-sonnet-4-5-20250929",
-        temperature=0.7,
-        api_key=api_key,
-    )
+    llm = get_next_llm(temperature=0.7)
 
     tools = [build_python_repl_tool(dfs_dict)]
     prompt = get_tool_calling_prompt()
@@ -744,15 +777,7 @@ def format_agent_output(user_question: str, raw_output: str, dfs_dict: Dict[str,
         # Try to extract numerical data from the raw output for validation
         data_dict = {}
         
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            return raw_output, data_dict
-
-        llm = ChatAnthropic(
-            model="claude-sonnet-4-5-20250929",
-            temperature=0.3,
-            api_key=api_key,
-        )
+        llm = get_next_llm(temperature=0.3)
         
         data_context = []
         for key, df in list(dfs_dict.items())[:3]:
@@ -1061,9 +1086,8 @@ def main():
             st.error("No data loaded. Add files to data/ folder and reload.")
             return
 
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            st.error("⚠️ ANTHROPIC_API_KEY not configured in .env file.")
+        if not _LLM_ROTATION:
+            st.error("⚠️ No API keys configured. Set GROQ_API_KEY_1/2 and GOOGLE_API_KEY_1/2 in .env file.")
             return
 
         executor, err = create_agent_executor(dfs_dict)
