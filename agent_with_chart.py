@@ -40,13 +40,21 @@ load_dotenv()
 # Round-Robin LLM Provider (Groq ↔ Gemini rotation)
 # =============================================================================
 
-# Order: groq1 → gemini1 → groq2 → gemini2 → repeat
-_LLM_ROTATION = []
+# Separate lists: Gemini keys (high RPM, used for multi-step agent)
+#                 All keys rotated for single-shot calls
+_GEMINI_KEYS = []
+_ALL_ROTATION = []  # groq1 → gemini1 → groq2 → gemini2
 
 def _build_rotation():
-    """Build the rotation list from env keys."""
-    global _LLM_ROTATION
-    _LLM_ROTATION = []
+    """Build the rotation lists from env keys."""
+    global _GEMINI_KEYS, _ALL_ROTATION
+    _GEMINI_KEYS = []
+    _ALL_ROTATION = []
+
+    for key in [os.getenv("GOOGLE_API_KEY_1"), os.getenv("GOOGLE_API_KEY_2")]:
+        if key and not key.startswith("your_"):
+            _GEMINI_KEYS.append(key)
+
     pairs = [
         ("groq",   os.getenv("GROQ_API_KEY_1")),
         ("gemini", os.getenv("GOOGLE_API_KEY_1")),
@@ -55,36 +63,86 @@ def _build_rotation():
     ]
     for provider, key in pairs:
         if key and not key.startswith("your_"):
-            _LLM_ROTATION.append((provider, key))
+            _ALL_ROTATION.append((provider, key))
 
-_llm_call_counter = 0
+_single_call_counter = 0
+_gemini_call_counter = 0
 
-def get_next_llm(temperature: float = 0.7):
-    """Return the next LLM in the round-robin rotation."""
-    global _llm_call_counter
-
-    if not _LLM_ROTATION:
-        _build_rotation()
-    if not _LLM_ROTATION:
-        raise ValueError("No valid API keys found in .env (GROQ_API_KEY_1/2, GOOGLE_API_KEY_1/2)")
-
-    provider, api_key = _LLM_ROTATION[_llm_call_counter % len(_LLM_ROTATION)]
-    _llm_call_counter += 1
-
-    logger.info(f"LLM rotation #{_llm_call_counter}: using {provider} (key ...{api_key[-6:]})")
-
+def _make_llm(provider: str, api_key: str, temperature: float):
+    """Create an LLM instance for the given provider."""
     if provider == "groq":
         return ChatGroq(
             model="llama-3.3-70b-versatile",
             temperature=temperature,
             api_key=api_key,
         )
-    else:  # gemini
+    else:
         return ChatGoogleGenerativeAI(
-            model="gemini-3-flash-preview",
+            model="gemini-2.0-flash",
             temperature=temperature,
             google_api_key=api_key,
         )
+
+def get_agent_llm(temperature: float = 0.7):
+    """Return a Gemini LLM for the ReAct agent (multi-step, needs high RPM).
+    Alternates between the two Gemini keys."""
+    global _gemini_call_counter
+
+    if not _GEMINI_KEYS:
+        _build_rotation()
+    if not _GEMINI_KEYS:
+        raise ValueError("No Gemini API keys found (GOOGLE_API_KEY_1/2)")
+
+    key = _GEMINI_KEYS[_gemini_call_counter % len(_GEMINI_KEYS)]
+    _gemini_call_counter += 1
+    logger.info(f"Agent LLM: gemini (key ...{key[-6:]})")
+    return ChatGoogleGenerativeAI(
+        model="gemini-2.0-flash",
+        temperature=temperature,
+        google_api_key=key,
+    )
+
+def get_next_llm(temperature: float = 0.7):
+    """Return the next LLM in round-robin for single-shot calls.
+    If the chosen provider fails (rate limit), automatically tries the next one."""
+    global _single_call_counter
+
+    if not _ALL_ROTATION:
+        _build_rotation()
+    if not _ALL_ROTATION:
+        raise ValueError("No valid API keys found in .env (GROQ_API_KEY_1/2, GOOGLE_API_KEY_1/2)")
+
+    provider, api_key = _ALL_ROTATION[_single_call_counter % len(_ALL_ROTATION)]
+    _single_call_counter += 1
+    logger.info(f"Single-shot LLM: {provider} (key ...{api_key[-6:]})")
+    return _make_llm(provider, api_key, temperature)
+
+def invoke_with_fallback(prompt, temperature: float = 0.7):
+    """Invoke a single-shot LLM call with automatic fallback on rate limit."""
+    global _single_call_counter
+
+    if not _ALL_ROTATION:
+        _build_rotation()
+
+    attempts = len(_ALL_ROTATION)
+    last_error = None
+
+    for _ in range(attempts):
+        provider, api_key = _ALL_ROTATION[_single_call_counter % len(_ALL_ROTATION)]
+        _single_call_counter += 1
+        try:
+            llm = _make_llm(provider, api_key, temperature)
+            logger.info(f"Trying {provider} (key ...{api_key[-6:]})")
+            return llm.invoke(prompt)
+        except Exception as e:
+            last_error = e
+            err_str = str(e).lower()
+            if "429" in str(e) or "rate" in err_str or "quota" in err_str or "resource_exhausted" in err_str:
+                logger.warning(f"{provider} rate limited, trying next provider...")
+                continue
+            raise  # non-rate-limit error, re-raise immediately
+
+    raise last_error  # all providers exhausted
 
 _build_rotation()
 
@@ -499,8 +557,6 @@ def detect_chart_opportunity(user_question: str, answer_text: str) -> Optional[D
     Returns None or a dict describing the chart idea.
     """
     try:
-        llm = get_next_llm(temperature=0.7)
-
         prompt = f"""You are deciding whether a chart would meaningfully support the answer.
 
 Question: {user_question}
@@ -521,7 +577,7 @@ If a chart WOULD help, reply ONLY with valid JSON (no extra text):
 
 If NO chart needed, reply exactly: NO"""
 
-        response = extract_text(llm.invoke(prompt).content).strip()
+        response = extract_text(invoke_with_fallback(prompt, temperature=0.7).content).strip()
         logger.info(f"Chart detection response: {response}")
 
         if "NO" in response.upper() and "{" not in response:
@@ -548,8 +604,6 @@ def generate_chart_code(user_question: str, chart_intent: Dict[str, Any], dfs_di
     Returns Python code as string or None if generation fails.
     """
     try:
-        llm = get_next_llm(temperature=0.1)
-
         # Get COMPLETE dataset info - all datasets with ALL columns
         dataset_info = []
         for key, df in dfs_dict.items():
@@ -621,7 +675,7 @@ plt.tight_layout()
 
 Generate the complete code now:"""
 
-        response = extract_text(llm.invoke(prompt).content).strip()
+        response = extract_text(invoke_with_fallback(prompt, temperature=0.1).content).strip()
         logger.info(f"Generated chart code length: {len(response)}")
 
         # Extract code from markdown if present
@@ -744,11 +798,11 @@ def get_tool_calling_prompt() -> ChatPromptTemplate:
 
 
 def create_agent_executor(dfs_dict: Dict[str, pd.DataFrame]):
-    """Create tool-calling agent with Groq/Gemini LLM (round-robin)."""
-    if not _LLM_ROTATION:
+    """Create tool-calling agent with Gemini LLM (high RPM for multi-step agent)."""
+    if not _GEMINI_KEYS and not _ALL_ROTATION:
         return None, "No API keys found. Set GROQ_API_KEY_1/2 and GOOGLE_API_KEY_1/2 in .env file."
 
-    llm = get_next_llm(temperature=0.7)
+    llm = get_agent_llm(temperature=0.7)
 
     tools = [build_python_repl_tool(dfs_dict)]
     prompt = get_tool_calling_prompt()
@@ -776,8 +830,6 @@ def format_agent_output(user_question: str, raw_output: str, dfs_dict: Dict[str,
         
         # Try to extract numerical data from the raw output for validation
         data_dict = {}
-        
-        llm = get_next_llm(temperature=0.3)
         
         data_context = []
         for key, df in list(dfs_dict.items())[:3]:
@@ -819,7 +871,7 @@ The top 5 customers by total sales are led by Krishna Cycle Stores at ₹8,45,00
 Response:"""
 
         try:
-            insights_response = llm.invoke(insight_prompt)
+            insights_response = invoke_with_fallback(insight_prompt, temperature=0.3)
             insights = extract_text(insights_response.content).strip()
             return insights, data_dict
         except Exception as e:
@@ -1086,7 +1138,7 @@ def main():
             st.error("No data loaded. Add files to data/ folder and reload.")
             return
 
-        if not _LLM_ROTATION:
+        if not _ALL_ROTATION:
             st.error("⚠️ No API keys configured. Set GROQ_API_KEY_1/2 and GOOGLE_API_KEY_1/2 in .env file.")
             return
 
