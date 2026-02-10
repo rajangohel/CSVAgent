@@ -26,7 +26,6 @@ import seaborn as sns
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.tools import tool
-from langchain_core.messages import HumanMessage, AIMessage
 from langchain_classic.agents import AgentExecutor
 from langchain_classic.agents.format_scratchpad.tools import format_to_tool_messages
 from langchain_classic.agents.output_parsers.tools import ToolsAgentOutputParser
@@ -701,7 +700,6 @@ def get_tool_calling_prompt() -> ChatPromptTemplate:
     """Prompt for tool-calling agent (native tool use; works with Claude)."""
     return ChatPromptTemplate.from_messages([
         ("system", get_agent_instructions()),
-        MessagesPlaceholder("chat_history", optional=True),
         ("human", "{input}"),
         MessagesPlaceholder("agent_scratchpad"),
     ])
@@ -808,28 +806,11 @@ Response:"""
         return raw_output, {}
 
 
-def run_agent(agent_executor: AgentExecutor, user_input: str, chat_history_list: list = None) -> str:
+def run_agent(agent_executor: AgentExecutor, user_input: str) -> str:
     """Invoke agent and return final output."""
     try:
-        # Convert chat history to proper message objects for MessagesPlaceholder
-        chat_messages = []
-        if chat_history_list:
-            # Take last 5 messages to avoid token overflow
-            recent_history = chat_history_list[-10:]  # Get last 10 messages (5 exchanges)
-            for msg in recent_history:
-                content = msg.get('content', '')
-                # Truncate long messages
-                if estimate_tokens(content) > 400:
-                    content = truncate_text(content, max_tokens=400)
-                
-                if msg['role'] == 'user':
-                    chat_messages.append(HumanMessage(content=content))
-                elif msg['role'] == 'assistant':
-                    chat_messages.append(AIMessage(content=content))
-        
         result = agent_executor.invoke({
             "input": user_input,
-            "chat_history": chat_messages,  # Pass as list of message objects
         })
         
         output = extract_text(result.get("output", str(result)))
@@ -1104,12 +1085,7 @@ def main():
             progress = st.progress(0, text="Starting analysis…")
 
             progress.progress(10, text="Querying data and running code…")
-            raw_output = run_agent(
-                executor,
-                user_input,
-                [m for m in st.session_state.chat_history_react[:-1]
-                 if m["role"] in ["user", "assistant"]],
-            )
+            raw_output = run_agent(executor, user_input)
             progress.progress(50, text="Data analysis complete. Formatting response…")
 
             formatted_output, data_dict = format_agent_output(
